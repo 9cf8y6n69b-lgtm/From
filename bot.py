@@ -19,6 +19,7 @@ PORT = int(os.environ.get("PORT", "8080"))
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 COLOR = 0x967A62
+DEFAULT_PHOTOS_CH = 1501306907577815132  # روم الصور الرئيسي (يُعدَّل من الداشبورد)
 
 # ───────────── الصور والأيقونات والإيموجي ─────────────
 W, H = 1170, 1130
@@ -465,7 +466,10 @@ CREATE TABLE IF NOT EXISTS gatherings(id INTEGER PRIMARY KEY AUTOINCREMENT, user
   symbol TEXT, channel_id INTEGER, message_id INTEGER, active INTEGER DEFAULT 1);
 """)
 for _sql in ("ALTER TABLE members ADD COLUMN deputy INTEGER DEFAULT 0",
-             "ALTER TABLE gatherings ADD COLUMN forum_id INTEGER"):
+             "ALTER TABLE gatherings ADD COLUMN forum_id INTEGER",
+             "ALTER TABLE forums ADD COLUMN gather_id INTEGER",
+             "ALTER TABLE forums ADD COLUMN photos_id INTEGER",
+             "ALTER TABLE gatherings ADD COLUMN pub INTEGER DEFAULT 0"):
     try:
         con.execute(_sql)
         con.commit()
@@ -490,7 +494,7 @@ def allrows(sql, a=()):
 SETTING_KEYS = {
     "requests_ch": "روم طلبات المنتديات (ID)",
     "notices_ch": "روم إشعارات التجمعات (ID)",
-    "photos_ch": "روم صور التجمعات (ID)",
+    "photos_ch": "روم الصور الرئيسي (ID)",
     "gather_ping_role": "رتبة التجمع - تنمنشن (ID)",
     "gather_manager_role": "رتبة مسؤول التجمعات (ID)",
     "admin_role": "رتبة الإدارة (ID)",
@@ -500,10 +504,14 @@ SETTING_KEYS = {
     "max_deputies": "أقصى عدد نواب للمنتدى (الافتراضي 2)",
     "max_warns": "عدد التحذيرات اللي يطلّع العضو تلقائياً (الافتراضي 3، و0 = بدون)",
     "voice_count": "عدد الرومات الصوتية للمنتدى (الافتراضي 4)",
-    "chat_count": "عدد رومات الشات للمنتدى (الافتراضي 3)",
-    "voice_name": "اسم الرومات الصوتية (الافتراضي صوتي)",
+    "chat_count": "عدد رومات الشات للمنتدى (الافتراضي 2)",
+    "voice_name": "اسم الرومات الصوتية (فاضي = اسم المنتدى)",
     "chat_name": "اسم رومات الشات (الافتراضي شات)",
     "owner_name": "اسم روم الأونر (الافتراضي اونر)",
+    "pub_gather_ch": "روم لوحة التجمع العام (ID)",
+    "pub_mention": "منشن التجمع العام (1 = مفعّل، 0 = بدون)",
+    "pub_role": "رتبة منشن التجمع العام (ID)",
+    "pub_everyone": "من ينشئ التجمع العام (1 = الكل، 0 = مسؤولو التجمعات)",
 }
 
 
@@ -550,7 +558,7 @@ _AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
 
 def room_opts(**o):
-    d = {"voice": num("voice_count", 4), "chat": num("chat_count", 3), "vname": get("voice_name") or "صوتي",
+    d = {"voice": num("voice_count", 4), "chat": num("chat_count", 2), "vname": get("voice_name") or "",
          "cname": get("chat_name") or "شات", "oname": get("owner_name") or "اونر"}
     for k, v in o.items():
         if v is None or str(v).strip() == "":
@@ -580,21 +588,32 @@ async def create_forum(guild, f, opts=None):
         guild.default_role: P(view_channel=False),
         role: P(view_channel=True, connect=True, speak=True, send_messages=True, read_message_history=True),
         guild.me: P(view_channel=True, send_messages=True, manage_channels=True)})
+    vbase = o["vname"] or name
+    vperm = {guild.default_role: P(view_channel=True, connect=False),
+             role: P(view_channel=True, connect=True, speak=True),
+             guild.me: P(view_channel=True, connect=True, manage_channels=True)}
     for n in range(1, o["voice"] + 1):
-        await guild.create_voice_channel(_nm(o["vname"], n, o["voice"]), category=cat)
+        await guild.create_voice_channel(_nm(vbase, n, o["voice"]), category=cat, overwrites=vperm)
     chat = None
     for n in range(1, o["chat"] + 1):
         c = await guild.create_text_channel(_nm(o["cname"], n, o["chat"]), category=cat)
         chat = chat or c
+    gch = await guild.create_text_channel("تجمع", category=cat)
+    pch = await guild.create_text_channel("صور", category=cat)
     panel = await guild.create_text_channel(f"{o['oname']}-{name}"[:100], category=cat, overwrites={
         guild.default_role: P(view_channel=False), role: P(view_channel=False),
         owner: P(view_channel=True, read_message_history=True),
         guild.me: P(view_channel=True, send_messages=True, attach_files=True)})
     await owner.add_roles(role)
-    q("UPDATE forums SET status='active',role_id=?,category_id=?,panel_id=?,chat_id=? WHERE id=?",
-      (role.id, cat.id, panel.id, chat.id, f["id"]))
+    q("UPDATE forums SET status='active',role_id=?,category_id=?,panel_id=?,chat_id=?,gather_id=?,photos_id=? WHERE id=?",
+      (role.id, cat.id, panel.id, chat.id, gch.id, pch.id, f["id"]))
     q("INSERT OR REPLACE INTO members(forum_id,user_id,banned) VALUES(?,?,0)", (f["id"], owner.id))
-    await send_panel(guild, one("SELECT * FROM forums WHERE id=?", (f["id"],)))
+    fresh = one("SELECT * FROM forums WHERE id=?", (f["id"],))
+    await send_panel(guild, fresh)
+    try:
+        await send_gather_panel(guild, fresh)
+    except (ValueError, discord.HTTPException):
+        pass
     add_log(f["id"], "تم إنشاء المنتدى بواسطة الإدارة")
 
 
@@ -607,6 +626,34 @@ async def send_panel(guild, f):
         v.add_item(PanelBtn(a, f["id"]))
     await send_card(pn, "panel", "لوحة تحكم المنتدى", f["name"], text="تحكم بمنتداك من الأزرار بالأسفل.",
                     content=f"<@{f['owner_id']}>", view=v)
+
+
+async def send_gather_panel(guild, f):
+    gc = guild.get_channel(f["gather_id"] or 0)
+    if not gc:
+        raise ValueError("روم التجمع غير موجود")
+    await send_card(gc, "gpanel", "لوحة التجمعات", f["name"],
+                    text="أعلن تجمع منتداك من الأزرار بالأسفل، ويتم منشن رتبة المنتدى.", view=GatherView())
+
+
+async def ensure_rooms(guild, f):
+    cat = guild.get_channel(f["category_id"] or 0)
+    if not cat:
+        raise ValueError("كاتيجوري المنتدى غير موجود")
+    made = []
+    for col, name in (("gather_id", "تجمع"), ("photos_id", "صور")):
+        if not guild.get_channel(f[col] or 0):
+            ch = await guild.create_text_channel(name, category=cat)
+            q(f"UPDATE forums SET {col}=? WHERE id=?", (ch.id, f["id"]))
+            made.append(name)
+            if col == "gather_id":
+                try:
+                    await send_gather_panel(guild, one("SELECT * FROM forums WHERE id=?", (f["id"],)))
+                except (ValueError, discord.HTTPException):
+                    pass
+    if made:
+        add_log(f["id"], "إضافة رومات: " + "، ".join(made))
+    return made
 
 
 async def delete_forum(guild, f):
@@ -632,6 +679,9 @@ async def rename_forum(guild, f, new):
         await role.edit(name=new)
     if cat:
         await cat.edit(name=new)
+        for vc in cat.voice_channels:
+            if vc.name.startswith(f["name"]):
+                await vc.edit(name=(new + vc.name[len(f["name"]):])[:100])
     if pn:
         await pn.edit(name=f"اونر-{new}"[:100])
     add_log(f["id"], f"تغيير الاسم من {f['name']} إلى {new}")
@@ -903,7 +953,7 @@ async def finish_request(msg, user, ok, note):
 class AcceptModal(discord.ui.Modal, title="قبول المنتدى وتحديد الرومات"):
     vc = discord.ui.TextInput(label="عدد الرومات الصوتية (0-10)", max_length=2)
     cc = discord.ui.TextInput(label="عدد رومات الشات (1-10)", max_length=2)
-    vn = discord.ui.TextInput(label="اسم الرومات الصوتية", max_length=30)
+    vn = discord.ui.TextInput(label="اسم الصوتي (فاضي = اسم المنتدى)", max_length=30, required=False)
     cn = discord.ui.TextInput(label="اسم رومات الشات", max_length=30)
     ow = discord.ui.TextInput(label="اسم روم الأونر", max_length=30)
 
@@ -1159,6 +1209,40 @@ def can_gather(m):
     return any(role_of(m.id, f) for f in joined_forums(m.id))
 
 
+def can_public_gather(m):
+    return get("pub_everyone") == "1" or is_admin(m) or has_role(m, "gather_manager_role")
+
+
+async def end_gathering(guild, g):
+    q("UPDATE gatherings SET active=0 WHERE id=?", (g["id"],))
+    ch = guild.get_channel(g["channel_id"] or 0)
+    if ch:
+        try:
+            m = await ch.fetch_message(g["message_id"])
+            e = m.embeds[0]
+            e.color = 0xB33A3A
+            e.set_image(url="attachment://gend.png")
+            await m.edit(content=None, embed=e,
+                         attachments=[await acard("gend", "انتهى التجمع", g["server"], f"الرمز: {g['symbol']}")])
+        except (discord.HTTPException, IndexError):
+            pass
+    fo = one("SELECT * FROM forums WHERE id=?", (g["forum_id"],)) if g["forum_id"] else None
+    gc = guild.get_channel(fo["gather_id"] or 0) if fo else None
+    if gc and gc.id != g["channel_id"]:
+        try:
+            await send_card(gc, "gend", "انتهى التجمع", g["server"], f"الرمز: {g['symbol']}", color=0xB33A3A)
+        except discord.HTTPException:
+            pass
+    ph = guild.get_channel(int(get("photos_ch") or DEFAULT_PHOTOS_CH))
+    if ph:
+        try:
+            await send_card(ph, "photos", "صور التجمع", g["server"], f"الرمز: {g['symbol']}",
+                            text="انتهى التجمع، شاركوا صوركم هنا.")
+        except discord.HTTPException:
+            pass
+
+
+# ── تجمع المنتدى (لوحته داخل روم "تجمع" الخاص بالمنتدى، ويمنشن رتبة المنتدى) ──
 class GatherModal(discord.ui.Modal, title="تجمع جديد"):
     server = discord.ui.TextInput(label="اسم السيرفر", max_length=60)
     symbol = discord.ui.TextInput(label="رمز السيرفر", max_length=20)
@@ -1170,15 +1254,23 @@ class GatherModal(discord.ui.Modal, title="تجمع جديد"):
         if not roles:
             r = i.guild.get_role(int(get("gather_ping_role") or 0))
             roles = [r] if r else []
+        dest = i.guild.get_channel(int(get("notices_ch") or 0)) or i.channel
         server, symbol = str(self.server), str(self.symbol)
-        msg = await send_card(i.channel, "gnew", "تجمع جديد", server, f"الرمز: {symbol}", color=0x3A9B5C,
-                              fields=[("السيرفر", server, True), ("الرمز", symbol, True),
-                                      ("المنتدى", "، ".join(f["name"] for f in forums_) or "—", True),
-                                      ("المسؤول", i.user.mention, False)],
+        fields = [("السيرفر", server, True), ("الرمز", symbol, True),
+                  ("المنتدى", "، ".join(f["name"] for f in forums_) or "—", True), ("المسؤول", i.user.mention, False)]
+        msg = await send_card(dest, "gnew", "تجمع جديد", server, f"الرمز: {symbol}", color=0x3A9B5C, fields=fields,
                               content=" ".join(r.mention for r in roles) or None,
                               allowed_mentions=discord.AllowedMentions(roles=True))
-        q("INSERT INTO gatherings(user_id,server,symbol,channel_id,message_id,forum_id) VALUES(?,?,?,?,?,?)",
-          (i.user.id, server, symbol, i.channel.id, msg.id, forums_[0]["id"] if forums_ else None))
+        for f_ in forums_:
+            gc = i.guild.get_channel(f_["gather_id"] or 0)
+            if gc and gc.id != dest.id:
+                try:
+                    await send_card(gc, "gnew", "تجمع جديد", server, f"الرمز: {symbol}", color=0x3A9B5C,
+                                    fields=[("السيرفر", server, True), ("الرمز", symbol, True), ("المسؤول", i.user.mention, False)])
+                except discord.HTTPException:
+                    pass
+        q("INSERT INTO gatherings(user_id,server,symbol,channel_id,message_id,forum_id,pub) VALUES(?,?,?,?,?,?,0)",
+          (i.user.id, server, symbol, dest.id, msg.id, forums_[0]["id"] if forums_ else None))
         await i.followup.send(f"تم إعلان التجمع {em('check')}", ephemeral=True)
 
 
@@ -1198,25 +1290,66 @@ class GatherView(discord.ui.View):
     async def end(self, i, _):
         if not can_gather(i.user):
             return await i.response.send_message("لمسؤول التجمعات وأونر المنتدى ونوابه فقط.", ephemeral=True)
-        rows = allrows("SELECT * FROM gatherings WHERE user_id=? AND active=1", (i.user.id,))
+        rows = allrows("SELECT * FROM gatherings WHERE user_id=? AND active=1 AND COALESCE(pub,0)=0", (i.user.id,))
         if not rows:
             return await i.response.send_message("ما عندك تجمع شغال.", ephemeral=True)
         await i.response.defer(ephemeral=True)
         for g in rows:
-            q("UPDATE gatherings SET active=0 WHERE id=?", (g["id"],))
-            try:
-                m = await i.channel.fetch_message(g["message_id"])
-                e = m.embeds[0]
-                e.color = 0xB33A3A
-                e.set_image(url="attachment://gend.png")
-                await m.edit(content=None, embed=e,
-                             attachments=[await acard("gend", "انتهى التجمع", g["server"], f"الرمز: {g['symbol']}")])
-            except discord.HTTPException:
-                pass
-            ph = i.guild.get_channel(int(get("photos_ch") or 0))
-            if ph:
-                await send_card(ph, "photos", "صور التجمع", g["server"], f"الرمز: {g['symbol']}",
-                                text="انتهى التجمع، شاركوا صوركم هنا.")
+            await end_gathering(i.guild, g)
+        await i.followup.send(f"تم إنهاء التجمع {em('check')}", ephemeral=True)
+
+
+# ── نظام إنشاء التجمع العام (مو مرتبط بمنتدى، المنشن يُحدد من الداشبورد) ──
+async def send_public_panel(guild, channel=None):
+    ch = guild.get_channel(int(get("pub_gather_ch") or 0)) or channel
+    if not ch:
+        raise ValueError("حدد روم لوحة التجمع العام من الإعدادات أول")
+    await send_card(ch, "gpanel", "إنشاء تجمع", "أعلن تجمعك بسهولة", text="اضغط الزر وأدخل اسم السيرفر والرمز.",
+                    view=PublicGatherView())
+
+
+class PublicGatherModal(discord.ui.Modal, title="إنشاء تجمع"):
+    server = discord.ui.TextInput(label="اسم السيرفر", max_length=60)
+    symbol = discord.ui.TextInput(label="رمز السيرفر", max_length=20)
+
+    async def on_submit(self, i):
+        await i.response.defer(ephemeral=True)
+        server, symbol = str(self.server), str(self.symbol)
+        content, allowed = None, discord.AllowedMentions.none()
+        if get("pub_mention") == "1":
+            r = i.guild.get_role(int(get("pub_role") or 0))
+            if r:
+                content, allowed = r.mention, discord.AllowedMentions(roles=True)
+        msg = await send_card(i.channel, "gnew", "تجمع جديد", server, f"الرمز: {symbol}", color=0x3A9B5C,
+                              fields=[("السيرفر", server, True), ("الرمز", symbol, True), ("المسؤول", i.user.mention, False)],
+                              content=content, allowed_mentions=allowed)
+        q("INSERT INTO gatherings(user_id,server,symbol,channel_id,message_id,pub) VALUES(?,?,?,?,?,1)",
+          (i.user.id, server, symbol, i.channel.id, msg.id))
+        await i.followup.send(f"تم إنشاء التجمع {em('check')}", ephemeral=True)
+
+
+class PublicGatherView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.children[0].emoji = emo("megaphone")
+        self.children[1].emoji = emo("stop")
+
+    @discord.ui.button(label="إنشاء تجمع", style=discord.ButtonStyle.success, custom_id="pg:start")
+    async def start(self, i, _):
+        if not can_public_gather(i.user):
+            return await i.response.send_message("إنشاء التجمع لمسؤولي التجمعات فقط.", ephemeral=True)
+        await i.response.send_modal(PublicGatherModal())
+
+    @discord.ui.button(label="إنهاء التجمع", style=discord.ButtonStyle.danger, custom_id="pg:end")
+    async def end(self, i, _):
+        if not can_public_gather(i.user):
+            return await i.response.send_message("إنهاء التجمع لمسؤولي التجمعات فقط.", ephemeral=True)
+        rows = allrows("SELECT * FROM gatherings WHERE user_id=? AND active=1 AND pub=1", (i.user.id,))
+        if not rows:
+            return await i.response.send_message("ما عندك تجمع شغال.", ephemeral=True)
+        await i.response.defer(ephemeral=True)
+        for g in rows:
+            await end_gathering(i.guild, g)
         await i.followup.send(f"تم إنهاء التجمع {em('check')}", ephemeral=True)
 
 
@@ -1225,12 +1358,14 @@ class Bot(commands.Bot):
     def __init__(self):
         it = discord.Intents.default()
         it.members = True
+        it.message_content = True
         super().__init__(command_prefix="!", intents=it)
 
     async def setup_hook(self):
         self.add_dynamic_items(RqBtn, PanelBtn, IvBtn)
         self.add_view(ApplyView())
         self.add_view(GatherView())
+        self.add_view(PublicGatherView())
         runner = web.AppRunner(make_web())
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", PORT).start()
@@ -1254,6 +1389,31 @@ class Bot(commands.Bot):
             print("[OK] تم تسجيل الأوامر")
         except discord.Forbidden:
             print("[خطأ] Missing Access: أعد إضافة البوت بصلاحية applications.commands")
+
+    async def on_message(self, message):
+        if message.author.bot or not message.guild or message.guild.id != GUILD_ID:
+            return
+        f = one("SELECT * FROM forums WHERE photos_id=?", (message.channel.id,))
+        if not f:
+            return
+        target = message.guild.get_channel(int(get("photos_ch") or DEFAULT_PHOTOS_CH))
+        if not target or target.id == message.channel.id:
+            return
+        files = []
+        for a in message.attachments[:10]:
+            try:
+                files.append(await a.to_file())
+            except discord.HTTPException:
+                pass
+        if not files and not message.content.strip():
+            return
+        e = discord.Embed(description=message.content or None, color=COLOR)
+        e.set_author(name=message.author.display_name, icon_url=message.author.display_avatar.url)
+        e.set_footer(text=f["name"])
+        try:
+            await target.send(embed=e, files=files, allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException as ex:
+            print("[تنبيه] تعذر نقل رسالة الصور:", ex)
 
     async def on_member_remove(self, member):
         if member.guild.id != GUILD_ID:
@@ -1333,6 +1493,17 @@ async def refresh_emojis(i: discord.Interaction):
     await i.response.defer(ephemeral=True)
     await load_emojis(force=True)
     await i.followup.send(f"تم تحديث {len(EMO)} إيموجي {em('check')}", ephemeral=True)
+
+
+@bot.tree.command(name="public_gather_panel", description="نشر لوحة نظام إنشاء التجمع العام")
+async def public_gather_panel(i: discord.Interaction):
+    if not admin_only(i):
+        return await i.response.send_message("للإدارة فقط.", ephemeral=True)
+    try:
+        await send_public_panel(i.guild, i.channel)
+    except (ValueError, discord.HTTPException) as ex:
+        return await i.response.send_message(f"{em('cross')} {ex}", ephemeral=True)
+    await i.response.send_message(f"تم {em('check')}", ephemeral=True)
 
 
 @bot.tree.command(name="backup", description="نسخة احتياطية من إعدادات وبيانات البوت")
@@ -1519,7 +1690,7 @@ def accept_form(fid, back):
             '<form method=post action=/fa style="margin-top:8px;min-width:340px;display:grid;grid-template-columns:1fr 1fr;gap:8px">'
             f'<input type=hidden name=act value=accept><input type=hidden name=id value={fid}><input type=hidden name=back value="{back}">'
             + num_("vc", "عدد الرومات الصوتية", o["voice"], 0, 10) + num_("cc", "عدد رومات الشات", o["chat"], 1, 10)
-            + txt("vn", "اسم الرومات الصوتية", o["vname"]) + txt("cn", "اسم رومات الشات", o["cname"])
+            + txt("vn", "اسم الصوتي (فاضي = اسم المنتدى)", o["vname"]) + txt("cn", "اسم رومات الشات", o["cname"])
             + txt("ow", "اسم روم الأونر", o["oname"]) + '<button style="grid-column:1/-1">قبول وإنشاء</button></form></details>')
 
 
@@ -1626,7 +1797,7 @@ def pg_forum(g, f):
             f'<div class=card><h3>تغيير الاسم</h3><form method=post action=/rename class=row><input type=hidden name=id value={fid}>'
             f'<input name=name value="{E(f["name"])}" style="flex:1"><button>حفظ</button></form></div>'
             f'<div class=card><h3>لوحة الأونر</h3><form method=post action=/fa>{hid}<input type=hidden name=act value=panel>'
-            f'<button class=g>إعادة نشر اللوحة</button></form></div></div>'
+            f'<button class=g>إعادة نشر اللوحة</button></form> <form method=post action=/fa style="display:inline">{hid}<input type=hidden name=act value=rooms><button class=g>إضافة رومات التجمع والصور</button></form> <form method=post action=/fa style="display:inline">{hid}<input type=hidden name=act value=gpanel><button class=g>إعادة نشر لوحة التجمع</button></form></div></div>'
             f'<div class=card><h2>سجل المنتدى</h2>{table(["الوقت", "الحدث"], logs, "لا يوجد سجل")}</div>'
             f'<div class="card danger"><h3>منطقة الخطر</h3><form method=post action=/delete onsubmit="return confirm(\'حذف المنتدى بكل رومـاته ورتبته؟\')">'
             f'<input type=hidden name=id value={fid}><button class=d>حذف المنتدى نهائياً</button></form></div>')
@@ -1664,9 +1835,14 @@ def pg_logs(g, fid=0):
 
 def pg_settings(g):
     def sel(name, options):
-        cur = str(get(name) or "")
+        cur = str(get(name) or (DEFAULT_PHOTOS_CH if name == "photos_ch" else ""))
         o = '<option value="">— غير محدد —</option>' + "".join(
             f'<option value="{v}"{" selected" if str(v) == cur else ""}>{E(l)}</option>' for v, l in options)
+        return f'<select name="{name}">{o}</select>'
+
+    def sel2(name, options, default):
+        cur = str(get(name) if get(name) is not None else default)
+        o = "".join(f'<option value="{v}"{" selected" if v == cur else ""}>{E(l)}</option>' for v, l in options)
         return f'<select name="{name}">{o}</select>'
 
     def fld(label, inner, hint=""):
@@ -1675,8 +1851,8 @@ def pg_settings(g):
     def numf(name, label, default, hint):
         return fld(label, f'<input type=number min=0 name="{name}" value="{E(str(get(name) if get(name) is not None else default))}">', hint)
 
-    def textf(name, label, default):
-        return fld(label, f'<input name="{name}" maxlength=30 value="{E(get(name) or default)}">', "")
+    def textf(name, label, default, hint=""):
+        return fld(label, f'<input name="{name}" maxlength=30 value="{E(get(name) or default)}">', hint)
 
     chans = [(c.id, "# " + c.name) for c in g.text_channels]
     roles = [(r.id, r.name) for r in sorted(g.roles, key=lambda r: -r.position) if not r.is_default()]
@@ -1684,7 +1860,7 @@ def pg_settings(g):
             '<div class=card><h2>الرومات</h2><div class=f2>'
             + fld("روم طلبات المنتديات", sel("requests_ch", chans), "تصل فيه طلبات التقديم")
             + fld("روم إشعارات التجمعات", sel("notices_ch", chans), "تُنشر فيه لوحة التجمعات")
-            + fld("روم صور التجمعات", sel("photos_ch", chans), "ينبّه فيه البوت عند انتهاء تجمع") +
+            + fld("روم الصور الرئيسي", sel("photos_ch", chans), "تنتقل له صور كل المنتديات، وينبّه فيه عند انتهاء تجمع") +
             '</div></div><div class=card><h2>الرتب</h2><div class=f2>'
             + fld("رتبة الإدارة", sel("admin_role", roles), "تقبل الطلبات وتتحكم بالبوت")
             + fld("رتبة مسؤول التجمعات", sel("gather_manager_role", roles), "تستخدم لوحة التجمعات")
@@ -1697,12 +1873,20 @@ def pg_settings(g):
             + numf("max_warns", "تحذيرات الطرد التلقائي", 3, "0 = بدون طرد تلقائي") +
             '</div></div><div class=card><h2>رومات المنتدى عند القبول</h2><div class=f2>'
             + numf("voice_count", "عدد الرومات الصوتية", 4, "من 0 إلى 10")
-            + numf("chat_count", "عدد رومات الشات", 3, "من 1 إلى 10")
-            + textf("voice_name", "اسم الرومات الصوتية", "صوتي")
+            + numf("chat_count", "عدد رومات الشات", 2, "من 1 إلى 10")
+            + textf("voice_name", "اسم الرومات الصوتية", "", "فاضي = اسم المنتدى")
             + textf("chat_name", "اسم رومات الشات", "شات")
             + textf("owner_name", "اسم روم الأونر", "اونر") +
             '</div><div class=hint style="margin-top:10px">هذي القيم الافتراضية، وتقدر تعدلها لكل منتدى وقت القبول.</div></div>'
-            '<button>حفظ الإعدادات</button></form>')
+            '<div class=card><h2>نظام إنشاء التجمع (عام)</h2><div class=f2>'
+            + fld("روم لوحة التجمع العام", sel("pub_gather_ch", chans), "تُنشر فيه اللوحة وتنزل فيه التجمعات")
+            + fld("المنشن", sel2("pub_mention", [("0", "بدون منشن"), ("1", "تفعيل المنشن")], "0"), "")
+            + fld("الرتبة اللي تتمنشن", sel("pub_role", roles), "تُستخدم فقط إذا المنشن مفعّل")
+            + fld("من يقدر ينشئ تجمع", sel2("pub_everyone", [("0", "مسؤولو التجمعات والإدارة"), ("1", "كل الأعضاء")], "0"), "") +
+            '</div></div><button>حفظ الإعدادات</button></form>'
+            '<form method=post action=/fa style="margin-top:14px"><input type=hidden name=act value=pubpanel>'
+            '<input type=hidden name=id value=0><input type=hidden name=back value=/settings>'
+            '<button class=g>نشر لوحة التجمع العام في الروم المحدد</button></form>')
 
 
 def make_web():
@@ -1821,7 +2005,9 @@ def make_web():
         uid = int(d["uid"]) if d.get("uid", "").strip().isdigit() else None
         msg = "تم"
         try:
-            if act == "cdclear":
+            if act == "pubpanel":
+                await send_public_panel(g)
+            elif act == "cdclear":
                 if not uid:
                     raise ValueError("اكتب ID صحيح")
                 q("DELETE FROM cooldowns WHERE user_id=?", (uid,))
@@ -1861,6 +2047,11 @@ def make_web():
                     q("DELETE FROM warnings WHERE forum_id=? AND user_id=?", (fid, uid))
                 elif act == "event":
                     await post_event(g, f, d.get("name", "").strip() or "فعالية", d.get("prize", "").strip() or "-")
+                elif act == "rooms":
+                    made = await ensure_rooms(g, f)
+                    msg = ("تم إنشاء: " + "، ".join(made)) if made else "الرومات موجودة"
+                elif act == "gpanel":
+                    await send_gather_panel(g, f)
                 elif act == "panel":
                     await send_panel(g, f)
         except (ValueError, discord.HTTPException) as ex:
@@ -2240,4 +2431,7 @@ if __name__ == "__main__":
         sys.exit(0)
     if not TOKEN or not GUILD_ID:
         sys.exit("ضع DISCORD_TOKEN و GUILD_ID في ملف .env")
-    bot.run(TOKEN)
+    try:
+        bot.run(TOKEN)
+    except discord.PrivilegedIntentsRequired:
+        sys.exit("فعّل Server Members Intent و Message Content Intent من بوابة المطورين (Bot ← Privileged Gateway Intents)")
