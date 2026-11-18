@@ -896,15 +896,27 @@ class Bot(commands.Bot):
         self.add_dynamic_items(RqBtn, PanelBtn, IvBtn)
         self.add_view(ApplyView())
         self.add_view(GatherView())
+        runner = web.AppRunner(make_web())
+        await runner.setup()
+        await web.TCPSite(runner, "0.0.0.0", PORT).start()
+
+    async def on_ready(self):
+        global GUILD_ID
+        if not self.get_guild(GUILD_ID):
+            print(f"⚠️ GUILD_ID={GUILD_ID} مو من سيرفرات البوت. السيرفرات: {[(x.name, x.id) for x in self.guilds]}")
+            if len(self.guilds) == 1:
+                GUILD_ID = self.guilds[0].id
+                print(f"✅ تم استخدام السيرفر الوحيد تلقائياً: {GUILD_ID}")
+        if getattr(self, "_synced", False) or not self.get_guild(GUILD_ID):
+            return
         g = discord.Object(GUILD_ID)
         self.tree.copy_global_to(guild=g)
         try:
             await self.tree.sync(guild=g)
+            self._synced = True
+            print("✅ تم تسجيل الأوامر")
         except discord.Forbidden:
-            print("❌ Missing Access: تأكد أن GUILD_ID هو ID السيرفر الصحيح، وأن البوت انضاف بصلاحية applications.commands")
-        runner = web.AppRunner(make_web())
-        await runner.setup()
-        await web.TCPSite(runner, "0.0.0.0", PORT).start()
+            print("❌ Missing Access: أعد إضافة البوت بصلاحية applications.commands")
 
     async def on_member_remove(self, member):
         if member.guild.id != GUILD_ID:
@@ -1332,7 +1344,12 @@ def make_web():
     def G():
         g = bot.get_guild(GUILD_ID)
         if not g:
-            raise web.HTTPServiceUnavailable(text="البوت غير متصل بالسيرفر")
+            lst = "".join(f"<li>{E(x.name)} — <code>{x.id}</code></li>" for x in bot.guilds) or "<li>البوت مو داخل أي سيرفر، أضفه من رابط الدعوة</li>"
+            raise web.HTTPServiceUnavailable(text=shell(
+                '<div class=login><div class=card style="text-align:right"><h2>البوت غير متصل بالسيرفر</h2>'
+                f'<p>الـ GUILD_ID الحالي: <code>{GUILD_ID}</code></p><p>السيرفرات اللي البوت داخلها:</p><ul>{lst}</ul>'
+                '<p class=hint>انسخ ID السيرفر الصحيح وحطه في GUILD_ID بإعدادات Render ثم أعد التشغيل.</p></div></div>'),
+                content_type="text/html")
         return g
 
     def out(s):
