@@ -16,6 +16,8 @@ TOKEN = os.environ.get("DISCORD_TOKEN", "")
 GUILD_ID = int(os.environ.get("GUILD_ID", "0") or 0)
 DASH_PASS = os.environ.get("DASH_PASSWORD", "change-me")
 PORT = int(os.environ.get("PORT", "8080"))
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
 COLOR = 0x967A62
 
 # ───────────── الصور (لوقو + لوحات) ─────────────
@@ -23,7 +25,7 @@ W, H = 1170, 1130
 BG = (150, 122, 96)
 CENTERS = [(585, 389), (475, 513), (695, 513), (363, 638), (585, 638), (805, 638)]
 R = 108
-FONT_PATH = os.path.join(os.path.dirname(__file__), "assets", "font.ttf")
+FONT_PATH = os.path.join(DATA_DIR, "assets", "font.ttf")
 
 
 def _fix(t):
@@ -188,7 +190,7 @@ def make_assets():
 
 
 # ───────────── قاعدة البيانات ─────────────
-con = sqlite3.connect("data.db", check_same_thread=False)
+con = sqlite3.connect(os.path.join(DATA_DIR, "data.db"), check_same_thread=False)
 con.row_factory = sqlite3.Row
 con.executescript("""
 CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT);
@@ -978,10 +980,10 @@ async def notice_panel(i: discord.Interaction):
 async def backup(i: discord.Interaction):
     if not admin_only(i):
         return await i.response.send_message("للإدارة فقط.", ephemeral=True)
-    d = sqlite3.connect("backup.db")
+    d = sqlite3.connect(os.path.join(DATA_DIR, "backup.db"))
     con.backup(d)
     d.close()
-    await i.response.send_message("نسختك:", file=discord.File("backup.db", f"backup-{int(time.time())}.db"),
+    await i.response.send_message("نسختك:", file=discord.File(os.path.join(DATA_DIR, "backup.db"), f"backup-{int(time.time())}.db"),
                                   ephemeral=True)
 
 
@@ -989,9 +991,9 @@ async def backup(i: discord.Interaction):
 async def restore(i: discord.Interaction, file: discord.Attachment):
     if not admin_only(i):
         return await i.response.send_message("للإدارة فقط.", ephemeral=True)
-    await file.save("restore.db")
+    await file.save(os.path.join(DATA_DIR, "restore.db"))
     try:
-        s = sqlite3.connect("restore.db")
+        s = sqlite3.connect(os.path.join(DATA_DIR, "restore.db"))
         s.execute("SELECT 1 FROM forums LIMIT 1")
         s.backup(con)
         s.close()
