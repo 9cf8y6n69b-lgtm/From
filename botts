@@ -1,0 +1,9 @@
+.env
+data.db
+backup.db
+restore.db
+__pycache__/
+*.pyc
+venv/
+.venv/
+assets/font.ttf
