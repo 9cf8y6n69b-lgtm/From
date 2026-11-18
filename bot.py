@@ -499,6 +499,11 @@ SETTING_KEYS = {
     "cooldown_days": "أيام الانتظار بعد الخروج من منتدى (الافتراضي 3، و0 = بدون)",
     "max_deputies": "أقصى عدد نواب للمنتدى (الافتراضي 2)",
     "max_warns": "عدد التحذيرات اللي يطلّع العضو تلقائياً (الافتراضي 3، و0 = بدون)",
+    "voice_count": "عدد الرومات الصوتية للمنتدى (الافتراضي 4)",
+    "chat_count": "عدد رومات الشات للمنتدى (الافتراضي 3)",
+    "voice_name": "اسم الرومات الصوتية (الافتراضي صوتي)",
+    "chat_name": "اسم رومات الشات (الافتراضي شات)",
+    "owner_name": "اسم روم الأونر (الافتراضي اونر)",
 }
 
 
@@ -541,7 +546,33 @@ PANEL_BUTTONS = [("invite", "دعوة", "plus"), ("kick", "إخراج", "exit"),
 OWNER_ONLY = {"rename", "deputy"}
 
 
-async def create_forum(guild, f):
+_AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+
+def room_opts(**o):
+    d = {"voice": num("voice_count", 4), "chat": num("chat_count", 3), "vname": get("voice_name") or "صوتي",
+         "cname": get("chat_name") or "شات", "oname": get("owner_name") or "اونر"}
+    for k, v in o.items():
+        if v is None or str(v).strip() == "":
+            continue
+        if k in ("vname", "cname", "oname"):
+            d[k] = str(v).strip()
+        else:
+            try:
+                d[k] = int(str(v).translate(_AR_DIGITS).strip())
+            except ValueError:
+                raise ValueError("اكتب أعداد الرومات بالأرقام")
+    d["voice"] = max(0, min(10, d["voice"]))
+    d["chat"] = max(1, min(10, d["chat"]))
+    return d
+
+
+def _nm(base, n, total):
+    return (f"{base} {n}" if total > 1 else base)[:100]
+
+
+async def create_forum(guild, f, opts=None):
+    o = opts or room_opts()
     name = f["name"]
     owner = guild.get_member(f["owner_id"]) or await guild.fetch_member(f["owner_id"])
     role = await guild.create_role(name=name, reason="forum approved")
@@ -549,13 +580,13 @@ async def create_forum(guild, f):
         guild.default_role: P(view_channel=False),
         role: P(view_channel=True, connect=True, speak=True, send_messages=True, read_message_history=True),
         guild.me: P(view_channel=True, send_messages=True, manage_channels=True)})
-    for n in range(1, 5):
-        await guild.create_voice_channel(f"صوتي {n}", category=cat)
+    for n in range(1, o["voice"] + 1):
+        await guild.create_voice_channel(_nm(o["vname"], n, o["voice"]), category=cat)
     chat = None
-    for n in range(1, 4):
-        c = await guild.create_text_channel(f"شات {n}", category=cat)
+    for n in range(1, o["chat"] + 1):
+        c = await guild.create_text_channel(_nm(o["cname"], n, o["chat"]), category=cat)
         chat = chat or c
-    panel = await guild.create_text_channel(f"اونر-{name}"[:100], category=cat, overwrites={
+    panel = await guild.create_text_channel(f"{o['oname']}-{name}"[:100], category=cat, overwrites={
         guild.default_role: P(view_channel=False), role: P(view_channel=False),
         owner: P(view_channel=True, read_message_history=True),
         guild.me: P(view_channel=True, send_messages=True, attach_files=True)})
@@ -818,14 +849,14 @@ class ApplyView(discord.ui.View):
         await i.response.send_modal(ApplyModal())
 
 
-async def process_request(guild, f, accept):
+async def process_request(guild, f, accept, opts=None):
     note = ""
     if accept:
         err = check_join(f["owner_id"], None, skip_pending=f["id"])
         if err or name_taken(f["name"], f["id"]):
             accept, note = False, plain(err or "اسم المنتدى مستخدم")
     if accept:
-        await create_forum(guild, f)
+        await create_forum(guild, f, opts)
     else:
         q("UPDATE forums SET status='rejected' WHERE id=?", (f["id"],))
     try:
@@ -855,12 +886,46 @@ class RqBtn(discord.ui.DynamicItem[discord.ui.Button], template=r"rq:(?P<a>ok|no
         f = one("SELECT * FROM forums WHERE id=?", (self.f,))
         if not f or f["status"] != "pending":
             return await i.response.send_message("الطلب تمت معالجته.", ephemeral=True)
+        if self.a == "ok":
+            return await i.response.send_modal(AcceptModal(f, i.message))
         await i.response.defer()
-        ok, note = await process_request(i.guild, f, self.a == "ok")
-        e = i.message.embeds[0]
-        e.color = 0x3A9B5C if ok else 0xB33A3A
-        e.set_footer(text=f"مقبول بواسطة {i.user}" if ok else f"مرفوض بواسطة {i.user}" + (f" (تلقائي: {note})" if note else ""))
-        await i.message.edit(embed=e, view=None)
+        ok, note = await process_request(i.guild, f, False)
+        await finish_request(i.message, i.user, ok, note)
+
+
+async def finish_request(msg, user, ok, note):
+    e = msg.embeds[0]
+    e.color = 0x3A9B5C if ok else 0xB33A3A
+    e.set_footer(text=f"مقبول بواسطة {user}" if ok else f"مرفوض بواسطة {user}" + (f" (تلقائي: {note})" if note else ""))
+    await msg.edit(embed=e, view=None)
+
+
+class AcceptModal(discord.ui.Modal, title="قبول المنتدى وتحديد الرومات"):
+    vc = discord.ui.TextInput(label="عدد الرومات الصوتية (0-10)", max_length=2)
+    cc = discord.ui.TextInput(label="عدد رومات الشات (1-10)", max_length=2)
+    vn = discord.ui.TextInput(label="اسم الرومات الصوتية", max_length=30)
+    cn = discord.ui.TextInput(label="اسم رومات الشات", max_length=30)
+    ow = discord.ui.TextInput(label="اسم روم الأونر", max_length=30)
+
+    def __init__(self, f, msg):
+        super().__init__()
+        self.f, self.msg = f, msg
+        o = room_opts()
+        self.vc.default, self.cc.default = str(o["voice"]), str(o["chat"])
+        self.vn.default, self.cn.default, self.ow.default = o["vname"], o["cname"], o["oname"]
+
+    async def on_submit(self, i):
+        try:
+            o = room_opts(voice=str(self.vc), chat=str(self.cc), vname=str(self.vn), cname=str(self.cn), oname=str(self.ow))
+        except ValueError as ex:
+            return await i.response.send_message(f"{em('cross')} {ex}", ephemeral=True)
+        await i.response.defer(ephemeral=True)
+        f = one("SELECT * FROM forums WHERE id=?", (self.f["id"],))
+        if not f or f["status"] != "pending":
+            return await i.followup.send("الطلب تمت معالجته.", ephemeral=True)
+        ok, note = await process_request(i.guild, f, True, o)
+        await finish_request(self.msg, i.user, ok, note)
+        await i.followup.send(f"{'تم قبول المنتدى' if ok else 'تم رفض الطلب'} {em('check' if ok else 'cross')}", ephemeral=True)
 
 
 # ───────────── لوحة الأونر ─────────────
@@ -1446,12 +1511,24 @@ def pg_login(bad=False):
                  'style="width:100%;margin-bottom:12px"><button style="width:100%">دخول</button></form></div></div>')
 
 
+def accept_form(fid, back):
+    o = room_opts()
+    num_ = lambda n, lb, v, lo, hi: (f'<div class=fld><label>{lb}</label><input type=number min={lo} max={hi} name={n} value={v}></div>')
+    txt = lambda n, lb, v: f'<div class=fld><label>{lb}</label><input name={n} value="{E(v)}" maxlength=30></div>'
+    return ('<details><summary><span class="badge b-ok">قبول…</span></summary>'
+            '<form method=post action=/fa style="margin-top:8px;min-width:340px;display:grid;grid-template-columns:1fr 1fr;gap:8px">'
+            f'<input type=hidden name=act value=accept><input type=hidden name=id value={fid}><input type=hidden name=back value="{back}">'
+            + num_("vc", "عدد الرومات الصوتية", o["voice"], 0, 10) + num_("cc", "عدد رومات الشات", o["chat"], 1, 10)
+            + txt("vn", "اسم الرومات الصوتية", o["vname"]) + txt("cn", "اسم رومات الشات", o["cname"])
+            + txt("ow", "اسم روم الأونر", o["oname"]) + '<button style="grid-column:1/-1">قبول وإنشاء</button></form></details>')
+
+
 def req_rows(g, rows, back):
     out = []
     for f in rows:
         out.append(f"<tr><td>{f['id']}</td><td><b>{E(f['name'])}</b></td><td>{E(f['size'] or '')}</td>"
                    f"<td>{E(f['tiktok'] or '')}</td><td>{uname(g, f['owner_id'])}</td>"
-                   f"<td>{btn('accept', f['id'], 0, 'قبول', '', back)}{btn('reject', f['id'], 0, 'رفض', 'd', back)}</td></tr>")
+                   f"<td>{accept_form(f['id'], back)}{btn('reject', f['id'], 0, 'رفض', 'd', back)}</td></tr>")
     return out
 
 
@@ -1598,6 +1675,9 @@ def pg_settings(g):
     def numf(name, label, default, hint):
         return fld(label, f'<input type=number min=0 name="{name}" value="{E(str(get(name) if get(name) is not None else default))}">', hint)
 
+    def textf(name, label, default):
+        return fld(label, f'<input name="{name}" maxlength=30 value="{E(get(name) or default)}">', "")
+
     chans = [(c.id, "# " + c.name) for c in g.text_channels]
     roles = [(r.id, r.name) for r in sorted(g.roles, key=lambda r: -r.position) if not r.is_default()]
     return ('<form method=post action=/settings>'
@@ -1615,7 +1695,14 @@ def pg_settings(g):
             + numf("cooldown_days", "أيام الانتظار بعد الخروج", 3, "0 = بدون انتظار")
             + numf("max_deputies", "أقصى عدد نواب للمنتدى", 2, "")
             + numf("max_warns", "تحذيرات الطرد التلقائي", 3, "0 = بدون طرد تلقائي") +
-            '</div></div><button>حفظ الإعدادات</button></form>')
+            '</div></div><div class=card><h2>رومات المنتدى عند القبول</h2><div class=f2>'
+            + numf("voice_count", "عدد الرومات الصوتية", 4, "من 0 إلى 10")
+            + numf("chat_count", "عدد رومات الشات", 3, "من 1 إلى 10")
+            + textf("voice_name", "اسم الرومات الصوتية", "صوتي")
+            + textf("chat_name", "اسم رومات الشات", "شات")
+            + textf("owner_name", "اسم روم الأونر", "اونر") +
+            '</div><div class=hint style="margin-top:10px">هذي القيم الافتراضية، وتقدر تعدلها لكل منتدى وقت القبول.</div></div>'
+            '<button>حفظ الإعدادات</button></form>')
 
 
 def make_web():
@@ -1746,7 +1833,9 @@ def make_web():
                 if act in ("accept", "reject"):
                     if f["status"] != "pending":
                         raise ValueError("الطلب تمت معالجته")
-                    ok, note = await process_request(g, f, act == "accept")
+                    opts = (room_opts(voice=d.get("vc"), chat=d.get("cc"), vname=d.get("vn"), cname=d.get("cn"),
+                                      oname=d.get("ow")) if act == "accept" else None)
+                    ok, note = await process_request(g, f, act == "accept", opts)
                     msg = "تم قبول الطلب وإنشاء المنتدى" if ok else "تم رفض الطلب" + (f" ({note})" if note else "")
                 elif act == "add":
                     mm = one("SELECT banned FROM members WHERE forum_id=? AND user_id=?", (fid, uid))
