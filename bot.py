@@ -898,7 +898,10 @@ class Bot(commands.Bot):
         self.add_view(GatherView())
         g = discord.Object(GUILD_ID)
         self.tree.copy_global_to(guild=g)
-        await self.tree.sync(guild=g)
+        try:
+            await self.tree.sync(guild=g)
+        except discord.Forbidden:
+            print("❌ Missing Access: تأكد أن GUILD_ID هو ID السيرفر الصحيح، وأن البوت انضاف بصلاحية applications.commands")
         runner = web.AppRunner(make_web())
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", PORT).start()
